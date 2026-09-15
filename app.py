@@ -867,7 +867,7 @@ def setup():
     ):
         return "forbidden", 403
 
-    base = request.url_root.rstrip("/")
+    base = base = "https://web-production-971c2.up.railway.app"
 
     body = {
         "url": base + "/webhook",
