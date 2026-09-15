@@ -38,8 +38,15 @@ def db():
         phone TEXT NOT NULL,
         category TEXT NOT NULL,
         created_at TEXT NOT NULL,
+        gender TEXT DEFAULT '',
+        svo TEXT DEFAULT '',
         UNIQUE(training_id,user_id)
     )""")
+    cols = {r[1] for r in c.execute("PRAGMA table_info(registrations)").fetchall()}
+    if "gender" not in cols:
+        c.execute("ALTER TABLE registrations ADD COLUMN gender TEXT DEFAULT ''")
+    if "svo" not in cols:
+        c.execute("ALTER TABLE registrations ADD COLUMN svo TEXT DEFAULT ''")
     c.commit()
     return c
 
@@ -228,7 +235,7 @@ def training_row(tid):
 def mine(uid, cancel=False):
     c = db()
     rs = c.execute("""
-        SELECT r.id,t.date,t.time,r.name,r.category
+        SELECT r.id,t.date,t.time,r.name,r.category,r.gender,r.svo
         FROM registrations r
         JOIN trainings t ON t.id=r.training_id
         WHERE r.user_id=?
@@ -242,7 +249,7 @@ def mine(uid, cancel=False):
         rows.append([btn("⬅️ Главное меню", "main")])
         return send(uid, "Какую запись отменить?", rows)
     text = "📋 Ваши записи:\n\n" + "\n\n".join(
-        f"• {r['date']} в {r['time']}\n  {r['name']}\n  Категория: {r['category']}" for r in rs
+        f"• {r['date']} в {r['time']}\n  {r['name']}\n  Пол: {r['gender'] or '—'}\n  Категория: {r['category']}\n  Участник СВО / ветеран: {r['svo'] or '—'}" for r in rs
     )
     send(uid, text, [[btn("⬅️ Главное меню", "main")]])
 
@@ -251,7 +258,7 @@ def show_participants(uid, tid, removal=False):
     c = db()
     t = c.execute("SELECT * FROM trainings WHERE id=?", (tid,)).fetchone()
     rs = c.execute("""
-        SELECT id,name,phone,category,user_id
+        SELECT id,name,phone,category,user_id,gender,svo
         FROM registrations
         WHERE training_id=?
         ORDER BY id
@@ -272,7 +279,7 @@ def show_participants(uid, tid, removal=False):
     else:
         lines = []
         for i, r in enumerate(rs, 1):
-            lines.append(f"{i}. {r['name']}\n📞 {r['phone']}\n🏷 {r['category']}\nMAX ID: {r['user_id']}")
+            lines.append(f"{i}. {r['name']}\n📞 {r['phone']}\n🚻 Пол: {r['gender'] or '—'}\n🏷 Категория: {r['category']}\n🎖 Участник СВО / ветеран: {r['svo'] or '—'}\nMAX ID: {r['user_id']}")
         text = f"👥 {t['date']} • {t['time']}\n\n" + "\n\n".join(lines)
     send(uid, text, [[btn("⬅️ Админ-меню", "admin")]])
 
@@ -332,17 +339,39 @@ def callback(u, uid):
     if payload.startswith("choose:"):
         return start_booking(uid, int(payload.split(":")[-1]))
 
+    if payload.startswith("gender:"):
+        st = states.get(uid, {})
+        if st.get("step") != "gender":
+            return menu(uid)
+        st["gender"] = payload.split(":", 1)[1]
+        st["step"] = "category"
+        return send(uid, "🏷 Выберите категорию:", [
+            [btn("Общая", "cat:Общая"), btn("ПОДА", "cat:ПОДА")],
+            [btn("⬅️ Отмена", "main")],
+        ])
+
     if payload.startswith("cat:"):
         st = states.get(uid, {})
         if st.get("step") != "category":
             return menu(uid)
-        category = payload[4:]
-        st["category"] = category
+        st["category"] = payload.split(":", 1)[1]
+        st["step"] = "svo"
+        return send(uid, "🎖 Участник СВО / ветеран?", [
+            [btn("Да", "svo:Да"), btn("Нет", "svo:Нет")],
+            [btn("⬅️ Отмена", "main")],
+        ])
+
+    if payload.startswith("svo:"):
+        st = states.get(uid, {})
+        if st.get("step") != "svo":
+            return menu(uid)
+        st["svo"] = payload.split(":", 1)[1]
         st["step"] = "consent"
         return send(uid,
             "🔐 Согласие на обработку персональных данных\n\n"
-            "Для записи бот сохраняет ваши ФИО, номер телефона, категорию и MAX ID. "
-            "Данные используются только для организации тренировки.\n\n"
+            "Для записи бот сохраняет ваши ФИО, номер телефона, пол, категорию, "
+            "ответ о статусе участника СВО / ветерана и MAX ID. "
+            "Данные используются для организации тренировки.\n\n"
             "Подтверждая запись, вы соглашаетесь на обработку этих данных.",
             [[btn("✅ Согласен и записаться", "consent:yes")],
              [btn("❌ Не согласен", "consent:no")]]
@@ -366,11 +395,12 @@ def callback(u, uid):
         c = db()
         try:
             c.execute("""
-                INSERT INTO registrations(training_id,user_id,name,phone,category,created_at)
-                VALUES(?,?,?,?,?,?)
+                INSERT INTO registrations(training_id,user_id,name,phone,category,created_at,gender,svo)
+                VALUES(?,?,?,?,?,?,?,?)
             """, (
                 tid, uid, st["name"], st["phone"], st["category"],
-                datetime.now().isoformat(timespec="seconds")
+                datetime.now().isoformat(timespec="seconds"),
+                st["gender"], st["svo"]
             ))
             c.commit()
         except sqlite3.IntegrityError:
@@ -386,7 +416,9 @@ def callback(u, uid):
             f"🕒 {r['time']}\n"
             f"👤 {st['name']}\n"
             f"📞 {st['phone']}\n"
-            f"🏷 Категория: {st['category']}"
+            f"🚻 Пол: {st['gender']}\n"
+            f"🏷 Категория: {st['category']}\n"
+            f"🎖 Участник СВО / ветеран: {st['svo']}"
         )
         send(uid, text, [[btn("📋 Мои записи", "mine")], [btn("⬅️ Главное меню", "main")]])
         notice = (
@@ -394,7 +426,9 @@ def callback(u, uid):
             f"📅 {r['date']} • {r['time']}\n"
             f"👤 {st['name']}\n"
             f"📞 {st['phone']}\n"
-            f"🏷 {st['category']}\n"
+            f"🚻 Пол: {st['gender']}\n"
+            f"🏷 Категория: {st['category']}\n"
+            f"🎖 Участник СВО / ветеран: {st['svo']}\n"
             f"MAX ID: {uid}"
         )
         for aid in ADMINS:
@@ -547,11 +581,9 @@ def handle_text(uid, text):
                 "Например: +7 927 123-45-67"
             )
         st["phone"] = phone
-        st["step"] = "category"
-        return send(uid, "Выберите категорию:", [
-            [btn("Мужчины", "cat:Мужчины"), btn("Женщины", "cat:Женщины")],
-            [btn("ПОДА", "cat:ПОДА")],
-            [btn("Другая", "cat:Другая")],
+        st["step"] = "gender"
+        return send(uid, "🚻 Выберите пол:", [
+            [btn("Мужчина", "gender:Мужчина"), btn("Женщина", "gender:Женщина")],
             [btn("⬅️ Отмена", "main")],
         ])
 
