@@ -1,10 +1,16 @@
 import os
 import re
+import csv
+import io
+import time
 import sqlite3
-from datetime import datetime
+import threading
+from datetime import datetime, timedelta
+from urllib.parse import quote_plus
+
 import requests
 import urllib3
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -15,14 +21,31 @@ SECRET = os.environ.get("WEBHOOK_SECRET", "")
 ADMINS = {x.strip() for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip()}
 DB = os.environ.get("DB_PATH", "/tmp/bot.db")
 API = "https://platform-api2.max.ru"
+PUBLIC_URL = os.environ.get("PUBLIC_URL", "https://web-production-971c2.up.railway.app").rstrip("/")
+
+CONTACT_MAXIM = "+7 927 777-83-80"
+CONTACT_YAKOVLEV = "+7 904 745-03-99"
 
 states = {}
+reminder_thread_started = False
 
 
-def db():
-    c = sqlite3.connect(DB, timeout=20)
+def conn():
+    c = sqlite3.connect(DB, timeout=30)
     c.row_factory = sqlite3.Row
     c.execute("PRAGMA journal_mode=WAL")
+    c.execute("PRAGMA foreign_keys=ON")
+    return c
+
+
+def ensure_column(c, table, name, definition):
+    cols = {r[1] for r in c.execute(f"PRAGMA table_info({table})").fetchall()}
+    if name not in cols:
+        c.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+
+
+def init_db():
+    c = conn()
     c.execute("""CREATE TABLE IF NOT EXISTS trainings(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         date TEXT NOT NULL,
@@ -30,6 +53,13 @@ def db():
         capacity INTEGER NOT NULL,
         active INTEGER DEFAULT 1
     )""")
+    ensure_column(c, "trainings", "venue", "TEXT DEFAULT ''")
+    ensure_column(c, "trainings", "address", "TEXT DEFAULT ''")
+    ensure_column(c, "trainings", "distance", "TEXT DEFAULT ''")
+    ensure_column(c, "trainings", "note", "TEXT DEFAULT ''")
+    ensure_column(c, "trainings", "archived", "INTEGER DEFAULT 0")
+    ensure_column(c, "trainings", "reminder_sent", "INTEGER DEFAULT 0")
+
     c.execute("""CREATE TABLE IF NOT EXISTS registrations(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         training_id INTEGER NOT NULL,
@@ -38,17 +68,25 @@ def db():
         phone TEXT NOT NULL,
         category TEXT NOT NULL,
         created_at TEXT NOT NULL,
-        gender TEXT DEFAULT '',
-        svo TEXT DEFAULT '',
         UNIQUE(training_id,user_id)
     )""")
-    cols = {r[1] for r in c.execute("PRAGMA table_info(registrations)").fetchall()}
-    if "gender" not in cols:
-        c.execute("ALTER TABLE registrations ADD COLUMN gender TEXT DEFAULT ''")
-    if "svo" not in cols:
-        c.execute("ALTER TABLE registrations ADD COLUMN svo TEXT DEFAULT ''")
+    ensure_column(c, "registrations", "gender", "TEXT DEFAULT ''")
+    ensure_column(c, "registrations", "svo", "TEXT DEFAULT ''")
+    ensure_column(c, "registrations", "consent_at", "TEXT DEFAULT ''")
+    ensure_column(c, "registrations", "attendance", "TEXT DEFAULT ''")
+
+    c.execute("""CREATE TABLE IF NOT EXISTS waitlist(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        training_id INTEGER NOT NULL,
+        user_id TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE(training_id,user_id)
+    )""")
     c.commit()
-    return c
+    c.close()
+
+
+init_db()
 
 
 def admin(uid):
@@ -72,92 +110,23 @@ def send(uid, text, rows=None):
     if rows:
         body["attachments"] = keyboard(rows)
     try:
-        r = requests.post(
-            API + "/messages",
-            params={"user_id": uid},
-            headers=hdr(),
-            json=body,
-            timeout=20,
-            verify=False,
-        )
-        print("SEND", r.status_code, r.text, flush=True)
+        r = requests.post(API + "/messages", params={"user_id": uid}, headers=hdr(),
+                          json=body, timeout=20, verify=False)
+        print("SEND", r.status_code, r.text[:500], flush=True)
+        return r.ok
     except Exception as e:
         print("SEND ERROR", repr(e), flush=True)
+        return False
 
 
 def answer(callback_id):
     if not callback_id:
         return
     try:
-        requests.post(
-            API + "/answers",
-            params={"callback_id": callback_id},
-            headers=hdr(),
-            json={"notification": "Готово"},
-            timeout=20,
-            verify=False,
-        )
+        requests.post(API + "/answers", params={"callback_id": callback_id}, headers=hdr(),
+                      json={"notification": "Готово"}, timeout=20, verify=False)
     except Exception as e:
         print("ANSWER ERROR", repr(e), flush=True)
-
-
-def menu(uid):
-    rows = [
-        [btn("🎯 Записаться", "book")],
-        [btn("📋 Мои записи", "mine")],
-        [btn("❌ Отменить запись", "cancel")],
-        [btn("ℹ️ Информация", "info")],
-    ]
-    if admin(uid):
-        rows.append([btn("⚙️ Администрирование", "admin")])
-    send(uid, "🎯 Спортивное метание ножа | Самара\n\nВыберите действие:", rows)
-
-
-def amenu(uid):
-    if not admin(uid):
-        return menu(uid)
-    send(uid, "⚙️ Администрирование\n\nВыберите действие:", [
-        [btn("➕ Создать тренировку", "a:new")],
-        [btn("📅 Все тренировки", "a:all")],
-        [btn("👥 Записавшиеся", "a:list")],
-        [btn("🧑‍💼 Удалить участника", "a:remove")],
-        [btn("🔴 Закрыть запись", "a:close")],
-        [btn("🟢 Открыть запись", "a:open")],
-        [btn("🗑 Удалить тренировку", "a:delete")],
-        [btn("⬅️ Главное меню", "main")],
-    ])
-
-
-def trainings():
-    c = db()
-    rs = c.execute("""
-        SELECT t.*, COUNT(r.id) cnt
-        FROM trainings t
-        LEFT JOIN registrations r ON r.training_id=t.id
-        GROUP BY t.id
-        ORDER BY t.id DESC
-    """).fetchall()
-    c.close()
-    return rs
-
-
-def pick(uid, action, title, mode=None):
-    rs = trainings()
-    if mode == "active":
-        rs = [r for r in rs if r["active"]]
-    if mode == "inactive":
-        rs = [r for r in rs if not r["active"]]
-    if not rs:
-        return send(uid, "Подходящих тренировок нет.", [[btn("⬅️ Админ-меню", "admin")]])
-    rows = []
-    for r in rs:
-        icon = "🟢" if r["active"] else "🔴"
-        rows.append([btn(
-            f"{icon} #{r['id']} {r['date']} • {r['time']} ({r['cnt']}/{r['capacity']})",
-            f"{action}:{r['id']}"
-        )])
-    rows.append([btn("⬅️ Админ-меню", "admin")])
-    send(uid, title, rows)
 
 
 def uid_of(u):
@@ -177,11 +146,8 @@ def uid_of(u):
 
 
 def text_of(u):
-    return (
-        u.get("message", {}).get("body", {}).get("text")
-        or u.get("message", {}).get("text")
-        or ""
-    ).strip()
+    return (u.get("message", {}).get("body", {}).get("text")
+            or u.get("message", {}).get("text") or "").strip()
 
 
 def callback_data(u):
@@ -191,56 +157,143 @@ def callback_data(u):
 
 def valid_name(text):
     text = " ".join(text.strip().split())
-    if len(text) < 5 or len(text) > 100:
-        return False
-    if any(ch.isdigit() for ch in text):
-        return False
-    parts = text.split()
-    if len(parts) < 2:
-        return False
-    allowed = re.compile(r"^[A-Za-zА-Яа-яЁё\-\s]+$")
-    return bool(allowed.fullmatch(text))
+    return (5 <= len(text) <= 100 and len(text.split()) >= 2
+            and not any(ch.isdigit() for ch in text)
+            and bool(re.fullmatch(r"[A-Za-zА-Яа-яЁё\-\s]+", text)))
 
 
 def normalize_phone(text):
-    digits = re.sub(r"\D", "", text)
-    if len(digits) == 11 and digits[0] in ("7", "8"):
-        return "+7" + digits[1:]
-    if len(digits) == 10 and digits[0] == "9":
-        return "+7" + digits
-    return None
+    d = re.sub(r"\D", "", text)
+    if len(d) == 11 and d[0] in "78":
+        d = "7" + d[1:]
+    elif len(d) == 10 and d[0] == "9":
+        d = "7" + d
+    else:
+        return None
+    return f"+7 {d[1:4]} {d[4:7]}-{d[7:9]}-{d[9:]}"
 
 
-def valid_future_date(date_text):
+def parse_dt(date_text, time_text):
     try:
-        d = datetime.strptime(date_text, "%d.%m.%Y").date()
-        return d >= datetime.now().date()
+        return datetime.strptime(f"{date_text} {time_text}", "%d.%m.%Y %H:%M")
     except ValueError:
-        return False
+        return None
 
 
-def training_row(tid):
-    c = db()
-    r = c.execute("""
-        SELECT t.*, COUNT(r.id) cnt
-        FROM trainings t
-        LEFT JOIN registrations r ON r.training_id=t.id
-        WHERE t.id=?
-        GROUP BY t.id
-    """, (tid,)).fetchone()
+def training(tid):
+    c = conn()
+    r = c.execute("""SELECT t.*, COUNT(r.id) cnt
+                     FROM trainings t LEFT JOIN registrations r ON r.training_id=t.id
+                     WHERE t.id=? GROUP BY t.id""", (tid,)).fetchone()
     c.close()
     return r
 
 
+def all_trainings(include_archived=False):
+    c = conn()
+    q = """SELECT t.*, COUNT(r.id) cnt
+           FROM trainings t LEFT JOIN registrations r ON r.training_id=t.id"""
+    if not include_archived:
+        q += " WHERE COALESCE(t.archived,0)=0"
+    q += " GROUP BY t.id ORDER BY t.id DESC"
+    rs = c.execute(q).fetchall()
+    c.close()
+    return rs
+
+
+def training_text(t):
+    return (
+        f"📅 {t['date']} • {t['time']}\n"
+        f"📍 {t['venue'] or 'Место уточняется'}"
+        + (f"\n🏠 {t['address']}" if t["address"] else "")
+        + (f"\n🎯 Дистанция: {t['distance']}" if t["distance"] else "")
+        + f"\n👥 Записано: {t['cnt']}/{t['capacity']}"
+        + (f"\nℹ️ {t['note']}" if t["note"] else "")
+    )
+
+
+def map_url(address):
+    return "https://yandex.ru/maps/?text=" + quote_plus(address)
+
+
+def menu(uid):
+    rows = [
+        [btn("🎯 Записаться", "book")],
+        [btn("📋 Мои записи", "mine"), btn("❌ Отменить", "cancel")],
+        [btn("📍 Где тренируемся", "places"), btn("🎒 Что взять", "memo")],
+        [btn("☎️ Связь", "contacts")],
+    ]
+    if admin(uid):
+        rows.append([btn("⚙️ Администрирование", "admin")])
+    send(uid, "🎯 Спортивное метание ножа | Самара\n\nВыберите действие:", rows)
+
+
+def amenu(uid):
+    if not admin(uid):
+        return menu(uid)
+    send(uid, "⚙️ Администрирование", [
+        [btn("➕ Создать тренировку", "a:new"), btn("✏️ Изменить", "a:edit")],
+        [btn("👥 Записавшиеся", "a:list"), btn("🧑‍💼 Удалить участника", "a:remove")],
+        [btn("✅ Посещаемость", "a:attendance"), btn("📊 Статистика", "a:stats")],
+        [btn("📢 Рассылка", "a:broadcast"), btn("📥 Выгрузка CSV", "a:export")],
+        [btn("🔴 Закрыть", "a:close"), btn("🟢 Открыть", "a:open")],
+        [btn("🗃 Архивировать", "a:archive"), btn("🗂 Архив", "a:archives")],
+        [btn("🗑 Удалить", "a:delete")],
+        [btn("⬅️ Главное меню", "main")],
+    ])
+
+
+def pick(uid, action, title, filt="all", archived=False):
+    rs = all_trainings(include_archived=archived)
+    if filt == "active":
+        rs = [r for r in rs if r["active"] and not r["archived"]]
+    elif filt == "inactive":
+        rs = [r for r in rs if not r["active"] and not r["archived"]]
+    elif filt == "archive":
+        rs = [r for r in rs if r["archived"]]
+    else:
+        rs = [r for r in rs if not r["archived"]]
+    if not rs:
+        return send(uid, "Подходящих тренировок нет.", [[btn("⬅️ Админ-меню", "admin")]])
+    rows = []
+    for r in rs:
+        icon = "🗃" if r["archived"] else ("🟢" if r["active"] else "🔴")
+        rows.append([btn(f"{icon} #{r['id']} {r['date']} • {r['time']} ({r['cnt']}/{r['capacity']})",
+                         f"{action}:{r['id']}")])
+    rows.append([btn("⬅️ Админ-меню", "admin")])
+    send(uid, title, rows)
+
+
+def notify_training_users(tid, text):
+    c = conn()
+    users = c.execute("SELECT user_id FROM registrations WHERE training_id=?", (tid,)).fetchall()
+    c.close()
+    for r in users:
+        send(r["user_id"], text)
+
+
+def promote_waitlist(tid):
+    t = training(tid)
+    if not t or not t["active"] or t["cnt"] >= t["capacity"]:
+        return
+    c = conn()
+    w = c.execute("SELECT * FROM waitlist WHERE training_id=? ORDER BY id LIMIT 1", (tid,)).fetchone()
+    if w:
+        c.execute("DELETE FROM waitlist WHERE id=?", (w["id"],))
+        c.commit()
+    c.close()
+    if w:
+        send(w["user_id"],
+             f"🎉 Освободилось место!\n\n{training_text(t)}\n\n"
+             "Место не бронируется автоматически. Нажмите «Записаться», чтобы занять его.",
+             [[btn("🎯 Записаться", "book")]])
+
+
 def mine(uid, cancel=False):
-    c = db()
-    rs = c.execute("""
-        SELECT r.id,t.date,t.time,r.name,r.category,r.gender,r.svo
-        FROM registrations r
-        JOIN trainings t ON t.id=r.training_id
-        WHERE r.user_id=?
-        ORDER BY r.id DESC
-    """, (uid,)).fetchall()
+    c = conn()
+    rs = c.execute("""SELECT r.id,t.*,r.name,r.gender,r.category,r.svo
+                      FROM registrations r JOIN trainings t ON t.id=r.training_id
+                      WHERE r.user_id=? ORDER BY r.id DESC""", (uid,)).fetchall()
     c.close()
     if not rs:
         return send(uid, "У вас пока нет записей.", [[btn("⬅️ Главное меню", "main")]])
@@ -248,58 +301,97 @@ def mine(uid, cancel=False):
         rows = [[btn(f"❌ {r['date']} • {r['time']}", f"del:{r['id']}")] for r in rs]
         rows.append([btn("⬅️ Главное меню", "main")])
         return send(uid, "Какую запись отменить?", rows)
-    text = "📋 Ваши записи:\n\n" + "\n\n".join(
-        f"• {r['date']} в {r['time']}\n  {r['name']}\n  Пол: {r['gender'] or '—'}\n  Категория: {r['category']}\n  Участник СВО / ветеран: {r['svo'] or '—'}" for r in rs
-    )
-    send(uid, text, [[btn("⬅️ Главное меню", "main")]])
+    blocks = []
+    for r in rs:
+        block = (f"📅 {r['date']} • {r['time']}\n📍 {r['venue'] or 'Место уточняется'}"
+                 + (f"\n🏠 {r['address']}" if r["address"] else "")
+                 + (f"\n🎯 {r['distance']}" if r["distance"] else "")
+                 + f"\n👤 {r['name']}\n🚻 {r['gender'] or '—'}"
+                 + f"\n🏷 {r['category']}\n🎖 СВО/ветеран: {r['svo'] or '—'}")
+        blocks.append(block)
+    send(uid, "📋 Ваши записи:\n\n" + "\n\n".join(blocks),
+         [[btn("⬅️ Главное меню", "main")]])
 
 
 def show_participants(uid, tid, removal=False):
-    c = db()
+    c = conn()
     t = c.execute("SELECT * FROM trainings WHERE id=?", (tid,)).fetchone()
-    rs = c.execute("""
-        SELECT id,name,phone,category,user_id,gender,svo
-        FROM registrations
-        WHERE training_id=?
-        ORDER BY id
-    """, (tid,)).fetchall()
+    rs = c.execute("""SELECT id,name,phone,category,user_id,gender,svo,attendance
+                      FROM registrations WHERE training_id=? ORDER BY id""", (tid,)).fetchall()
     c.close()
     if not t:
-        return send(uid, "Тренировка не найдена.", [[btn("⬅️ Админ-меню", "admin")]])
+        return amenu(uid)
     if removal:
         if not rs:
-            return send(uid, "На эту тренировку пока никто не записан.",
-                        [[btn("⬅️ Админ-меню", "admin")]])
+            return send(uid, "Записавшихся нет.", [[btn("⬅️ Админ-меню", "admin")]])
         rows = [[btn(f"❌ {r['name']}", f"a:rmreg:{r['id']}")] for r in rs]
         rows.append([btn("⬅️ Админ-меню", "admin")])
-        return send(uid, f"🧑‍💼 Удаление участника\n\n{t['date']} • {t['time']}\nВыберите участника:", rows)
-
+        return send(uid, f"Удаление участника — {t['date']} • {t['time']}", rows)
     if not rs:
         text = f"👥 {t['date']} • {t['time']}\n\nЗаписавшихся пока нет."
     else:
-        lines = []
-        for i, r in enumerate(rs, 1):
-            lines.append(f"{i}. {r['name']}\n📞 {r['phone']}\n🚻 Пол: {r['gender'] or '—'}\n🏷 Категория: {r['category']}\n🎖 Участник СВО / ветеран: {r['svo'] or '—'}\nMAX ID: {r['user_id']}")
-        text = f"👥 {t['date']} • {t['time']}\n\n" + "\n\n".join(lines)
+        text = f"👥 {t['date']} • {t['time']}\n\n" + "\n\n".join(
+            f"{i}. {r['name']}\n📞 {r['phone']}\n🚻 {r['gender'] or '—'}"
+            f"\n🏷 {r['category']}\n🎖 СВО/ветеран: {r['svo'] or '—'}"
+            f"\n✅ Посещение: {r['attendance'] or 'не отмечено'}"
+            for i, r in enumerate(rs, 1))
     send(uid, text, [[btn("⬅️ Админ-меню", "admin")]])
 
 
+def attendance_list(uid, tid):
+    c = conn()
+    rs = c.execute("SELECT id,name,attendance FROM registrations WHERE training_id=? ORDER BY id",
+                   (tid,)).fetchall()
+    c.close()
+    if not rs:
+        return send(uid, "Записавшихся нет.", [[btn("⬅️ Админ-меню", "admin")]])
+    rows = []
+    for r in rs:
+        mark = "✅" if r["attendance"] == "Пришёл" else ("❌" if r["attendance"] == "Не пришёл" else "▫️")
+        rows.append([btn(f"{mark} {r['name']}", f"a:attone:{r['id']}")])
+    rows.append([btn("⬅️ Админ-меню", "admin")])
+    send(uid, "✅ Выберите участника:", rows)
+
+
+def stats(uid, tid):
+    c = conn()
+    total = c.execute("SELECT COUNT(*) n FROM registrations WHERE training_id=?", (tid,)).fetchone()["n"]
+    men = c.execute("SELECT COUNT(*) n FROM registrations WHERE training_id=? AND gender='Мужчина'", (tid,)).fetchone()["n"]
+    women = c.execute("SELECT COUNT(*) n FROM registrations WHERE training_id=? AND gender='Женщина'", (tid,)).fetchone()["n"]
+    poda = c.execute("SELECT COUNT(*) n FROM registrations WHERE training_id=? AND category='ПОДА'", (tid,)).fetchone()["n"]
+    svo = c.execute("SELECT COUNT(*) n FROM registrations WHERE training_id=? AND svo='Да'", (tid,)).fetchone()["n"]
+    came = c.execute("SELECT COUNT(*) n FROM registrations WHERE training_id=? AND attendance='Пришёл'", (tid,)).fetchone()["n"]
+    missed = c.execute("SELECT COUNT(*) n FROM registrations WHERE training_id=? AND attendance='Не пришёл'", (tid,)).fetchone()["n"]
+    waiting = c.execute("SELECT COUNT(*) n FROM waitlist WHERE training_id=?", (tid,)).fetchone()["n"]
+    c.close()
+    t = training(tid)
+    send(uid, f"📊 Статистика\n\n{training_text(t)}\n\n"
+              f"🚻 Мужчины: {men}\n🚻 Женщины: {women}\n"
+              f"♿ ПОДА: {poda}\n🎖 СВО/ветераны: {svo}\n"
+              f"✅ Пришли: {came}\n❌ Не пришли: {missed}\n"
+              f"⏳ Лист ожидания: {waiting}\n👥 Всего записано: {total}",
+         [[btn("⬅️ Админ-меню", "admin")]])
+
+
 def start_booking(uid, tid):
-    r = training_row(tid)
-    if not r or not r["active"]:
+    t = training(tid)
+    if not t or not t["active"] or t["archived"]:
         return send(uid, "Запись на эту тренировку закрыта.", [[btn("⬅️ Главное меню", "main")]])
-    if r["cnt"] >= r["capacity"]:
-        return send(uid, "На этой тренировке мест уже нет.", [[btn("⬅️ Главное меню", "main")]])
-    c = db()
-    exists = c.execute(
-        "SELECT 1 FROM registrations WHERE training_id=? AND user_id=?",
-        (tid, uid)
-    ).fetchone()
+    c = conn()
+    exists = c.execute("SELECT 1 FROM registrations WHERE training_id=? AND user_id=?", (tid, uid)).fetchone()
     c.close()
     if exists:
-        return send(uid, "Вы уже записаны на эту тренировку.", [[btn("📋 Мои записи", "mine")]])
+        return send(uid, "Вы уже записаны.", [[btn("📋 Мои записи", "mine")]])
+    if t["cnt"] >= t["capacity"]:
+        return send(uid, "Свободных мест нет. Добавить вас в лист ожидания?",
+                    [[btn("⏳ Да, в лист ожидания", f"wait:{tid}")],
+                     [btn("⬅️ Главное меню", "main")]])
     states[uid] = {"step": "name", "training_id": tid}
-    send(uid, "Введите ФИО полностью.\n\nНапример: Иванов Иван Иванович")
+    send(uid, "Введите ФИО полностью.\nНапример: Иванов Иван Иванович")
+
+
+def export_token(tid):
+    return f"{SECRET}:{tid}"
 
 
 def callback(u, uid):
@@ -307,149 +399,140 @@ def callback(u, uid):
     answer(cid)
 
     if payload == "main":
-        states.pop(uid, None)
-        return menu(uid)
+        states.pop(uid, None); return menu(uid)
     if payload == "admin":
-        states.pop(uid, None)
-        return amenu(uid)
+        states.pop(uid, None); return amenu(uid)
     if payload == "mine":
         return mine(uid)
     if payload == "cancel":
         return mine(uid, True)
-    if payload == "info":
-        return send(uid,
-            "ℹ️ Запись на тренировки по спортивному метанию ножа в Самаре.\n\n"
-            "Выберите «Записаться», укажите ФИО и телефон, затем категорию. "
-            "Количество мест ограничено.",
-            [[btn("⬅️ Главное меню", "main")]]
-        )
+    if payload == "contacts":
+        return send(uid, "☎️ Связь с организаторами\n\n"
+                    f"Максим Меделяев: {CONTACT_MAXIM}\n"
+                    f"Яковлев Андрей Владимирович,\nпрезидент Федерации спортивного метания ножа: {CONTACT_YAKOVLEV}",
+                    [[btn("⬅️ Главное меню", "main")]])
+    if payload == "memo":
+        return send(uid, "🎒 Что взять на тренировку\n\n"
+                    "• удобную спортивную одежду и закрытую обувь;\n"
+                    "• воду;\n"
+                    "• при необходимости — личные средства реабилитации;\n"
+                    "• прибыть заранее.\n\n"
+                    "Инвентарь и дополнительные требования уточняйте у организаторов.",
+                    [[btn("☎️ Связь", "contacts")], [btn("⬅️ Главное меню", "main")]])
+    if payload == "places":
+        rs = [r for r in all_trainings() if r["active"]]
+        if not rs:
+            return send(uid, "Открытых тренировок сейчас нет.", [[btn("⬅️ Главное меню", "main")]])
+        text = "📍 Ближайшие тренировки:\n\n" + "\n\n".join(training_text(r) for r in rs[:5])
+        return send(uid, text, [[btn("⬅️ Главное меню", "main")]])
 
     if payload == "book":
-        rs = [r for r in trainings() if r["active"] and r["cnt"] < r["capacity"]]
+        rs = [r for r in all_trainings() if r["active"] and not r["archived"]]
         if not rs:
-            return send(uid, "Сейчас нет открытых тренировок со свободными местами.",
-                        [[btn("⬅️ Главное меню", "main")]])
-        rows = [[btn(
-            f"🎯 {r['date']} • {r['time']} — свободно {r['capacity']-r['cnt']}",
-            f"choose:{r['id']}"
-        )] for r in rs]
+            return send(uid, "Сейчас нет открытых тренировок.", [[btn("⬅️ Главное меню", "main")]])
+        rows = [[btn(f"🎯 {r['date']} • {r['time']} — {max(0,r['capacity']-r['cnt'])} мест",
+                     f"choose:{r['id']}")] for r in rs]
         rows.append([btn("⬅️ Главное меню", "main")])
         return send(uid, "Выберите тренировку:", rows)
 
     if payload.startswith("choose:"):
         return start_booking(uid, int(payload.split(":")[-1]))
 
+    if payload.startswith("wait:"):
+        tid = int(payload.split(":")[-1])
+        c = conn()
+        try:
+            c.execute("INSERT INTO waitlist(training_id,user_id,created_at) VALUES(?,?,?)",
+                      (tid, uid, datetime.now().isoformat(timespec="seconds")))
+            c.commit()
+            msg = "✅ Вы добавлены в лист ожидания. Если место освободится, бот сообщит вам."
+        except sqlite3.IntegrityError:
+            msg = "Вы уже находитесь в листе ожидания."
+        c.close()
+        return send(uid, msg, [[btn("⬅️ Главное меню", "main")]])
+
     if payload.startswith("gender:"):
         st = states.get(uid, {})
-        if st.get("step") != "gender":
-            return menu(uid)
+        if st.get("step") != "gender": return menu(uid)
         st["gender"] = payload.split(":", 1)[1]
         st["step"] = "category"
-        return send(uid, "🏷 Выберите категорию:", [
-            [btn("Общая", "cat:Общая"), btn("ПОДА", "cat:ПОДА")],
-            [btn("⬅️ Отмена", "main")],
-        ])
+        return send(uid, "🏷 Выберите категорию:",
+                    [[btn("Общая", "cat:Общая"), btn("ПОДА", "cat:ПОДА")],
+                     [btn("⬅️ Отмена", "main")]])
 
     if payload.startswith("cat:"):
         st = states.get(uid, {})
-        if st.get("step") != "category":
-            return menu(uid)
+        if st.get("step") != "category": return menu(uid)
         st["category"] = payload.split(":", 1)[1]
         st["step"] = "svo"
-        return send(uid, "🎖 Участник СВО / ветеран?", [
-            [btn("Да", "svo:Да"), btn("Нет", "svo:Нет")],
-            [btn("⬅️ Отмена", "main")],
-        ])
+        return send(uid, "🎖 Участник СВО / ветеран?",
+                    [[btn("Да", "svo:Да"), btn("Нет", "svo:Нет")],
+                     [btn("⬅️ Отмена", "main")]])
 
     if payload.startswith("svo:"):
         st = states.get(uid, {})
-        if st.get("step") != "svo":
-            return menu(uid)
+        if st.get("step") != "svo": return menu(uid)
         st["svo"] = payload.split(":", 1)[1]
         st["step"] = "consent"
-        return send(uid,
-            "🔐 Согласие на обработку персональных данных\n\n"
-            "Для записи бот сохраняет ваши ФИО, номер телефона, пол, категорию, "
-            "ответ о статусе участника СВО / ветерана и MAX ID. "
-            "Данные используются для организации тренировки.\n\n"
-            "Подтверждая запись, вы соглашаетесь на обработку этих данных.",
-            [[btn("✅ Согласен и записаться", "consent:yes")],
-             [btn("❌ Не согласен", "consent:no")]]
-        )
+        return send(uid, "🔐 Согласие на обработку персональных данных\n\n"
+                    "Для записи бот сохраняет ФИО, телефон, пол, категорию, ответ о статусе "
+                    "участника СВО/ветерана и MAX ID. Данные используются для организации тренировок.\n\n"
+                    "Нажимая «Согласен», вы подтверждаете согласие на обработку указанных данных.",
+                    [[btn("✅ Согласен и записаться", "consent:yes")],
+                     [btn("❌ Не согласен", "consent:no")]])
 
     if payload == "consent:no":
         states.pop(uid, None)
-        return send(uid, "Запись отменена. Данные не сохранены.",
-                    [[btn("⬅️ Главное меню", "main")]])
+        return send(uid, "Запись отменена. Данные не сохранены.", [[btn("⬅️ Главное меню", "main")]])
 
     if payload == "consent:yes":
         st = states.get(uid, {})
-        if st.get("step") != "consent":
-            return menu(uid)
+        if st.get("step") != "consent": return menu(uid)
         tid = st["training_id"]
-        r = training_row(tid)
-        if not r or not r["active"] or r["cnt"] >= r["capacity"]:
+        t = training(tid)
+        if not t or not t["active"] or t["cnt"] >= t["capacity"]:
             states.pop(uid, None)
-            return send(uid, "К сожалению, запись уже закрыта или свободные места закончились.",
-                        [[btn("⬅️ Главное меню", "main")]])
-        c = db()
+            return send(uid, "Места уже закончились. Можно записаться в лист ожидания.",
+                        [[btn("⏳ В лист ожидания", f"wait:{tid}")], [btn("⬅️ Меню", "main")]])
+        c = conn()
         try:
-            c.execute("""
-                INSERT INTO registrations(training_id,user_id,name,phone,category,created_at,gender,svo)
-                VALUES(?,?,?,?,?,?,?,?)
-            """, (
-                tid, uid, st["name"], st["phone"], st["category"],
-                datetime.now().isoformat(timespec="seconds"),
-                st["gender"], st["svo"]
-            ))
+            now = datetime.now().isoformat(timespec="seconds")
+            c.execute("""INSERT INTO registrations
+                         (training_id,user_id,name,phone,category,created_at,gender,svo,consent_at)
+                         VALUES(?,?,?,?,?,?,?,?,?)""",
+                      (tid,uid,st["name"],st["phone"],st["category"],now,st["gender"],st["svo"],now))
+            c.execute("DELETE FROM waitlist WHERE training_id=? AND user_id=?", (tid,uid))
             c.commit()
         except sqlite3.IntegrityError:
-            c.close()
-            states.pop(uid, None)
-            return send(uid, "Вы уже записаны на эту тренировку.",
-                        [[btn("📋 Мои записи", "mine")]])
+            c.close(); states.pop(uid, None)
+            return send(uid, "Вы уже записаны.", [[btn("📋 Мои записи", "mine")]])
         c.close()
         states.pop(uid, None)
-        text = (
-            f"✅ Вы записаны!\n\n"
-            f"📅 {r['date']}\n"
-            f"🕒 {r['time']}\n"
-            f"👤 {st['name']}\n"
-            f"📞 {st['phone']}\n"
-            f"🚻 Пол: {st['gender']}\n"
-            f"🏷 Категория: {st['category']}\n"
-            f"🎖 Участник СВО / ветеран: {st['svo']}"
-        )
-        send(uid, text, [[btn("📋 Мои записи", "mine")], [btn("⬅️ Главное меню", "main")]])
-        notice = (
-            f"🎯 Новая запись\n\n"
-            f"📅 {r['date']} • {r['time']}\n"
-            f"👤 {st['name']}\n"
-            f"📞 {st['phone']}\n"
-            f"🚻 Пол: {st['gender']}\n"
-            f"🏷 Категория: {st['category']}\n"
-            f"🎖 Участник СВО / ветеран: {st['svo']}\n"
-            f"MAX ID: {uid}"
-        )
+        t = training(tid)
+        msg = (f"✅ Вы записаны!\n\n{training_text(t)}\n"
+               f"\n👤 {st['name']}\n📞 {st['phone']}\n🚻 Пол: {st['gender']}"
+               f"\n🏷 Категория: {st['category']}\n🎖 Участник СВО/ветеран: {st['svo']}")
+        if t["address"]:
+            msg += f"\n\n🗺 Карта: {map_url(t['address'])}"
+        send(uid, msg, [[btn("📋 Мои записи", "mine")], [btn("⬅️ Главное меню", "main")]])
         for aid in ADMINS:
-            send(aid, notice)
+            send(aid, f"🎯 Новая запись\n\n{training_text(t)}\n\n👤 {st['name']}\n📞 {st['phone']}"
+                      f"\n🚻 {st['gender']}\n🏷 {st['category']}\n🎖 СВО/ветеран: {st['svo']}")
         return
 
     if payload.startswith("del:"):
         rid = int(payload.split(":")[-1])
-        c = db()
-        row = c.execute("""
-            SELECT r.id,t.date,t.time
-            FROM registrations r JOIN trainings t ON t.id=r.training_id
-            WHERE r.id=? AND r.user_id=?
-        """, (rid, uid)).fetchone()
-        if row:
-            c.execute("DELETE FROM registrations WHERE id=? AND user_id=?", (rid, uid))
-            c.commit()
+        c = conn()
+        r = c.execute("""SELECT r.training_id,t.date,t.time FROM registrations r
+                         JOIN trainings t ON t.id=r.training_id WHERE r.id=? AND r.user_id=?""",
+                      (rid,uid)).fetchone()
+        if r:
+            c.execute("DELETE FROM registrations WHERE id=? AND user_id=?", (rid,uid)); c.commit()
         c.close()
-        if row:
+        if r:
             for aid in ADMINS:
-                send(aid, f"❌ Участник отменил запись\n\n📅 {row['date']} • {row['time']}\nMAX ID: {uid}")
+                send(aid, f"❌ Участник отменил запись\n📅 {r['date']} • {r['time']}")
+            promote_waitlist(r["training_id"])
             return send(uid, "✅ Запись отменена.", [[btn("⬅️ Главное меню", "main")]])
         return send(uid, "Запись не найдена.", [[btn("⬅️ Главное меню", "main")]])
 
@@ -457,226 +540,306 @@ def callback(u, uid):
         return menu(uid)
 
     if payload == "a:new":
-        states[uid] = {"step": "adate"}
-        return send(uid, "📅 Введите дату тренировки в формате ДД.ММ.ГГГГ\nНапример: 23.09.2026")
+        states[uid] = {"step":"adate"}
+        return send(uid, "📅 Введите дату ДД.ММ.ГГГГ\nНапример: 23.09.2026")
+    if payload == "a:list": return pick(uid,"a:show","Выберите тренировку:")
+    if payload == "a:remove": return pick(uid,"a:removelist","Выберите тренировку:")
+    if payload == "a:attendance": return pick(uid,"a:attlist","Выберите тренировку:")
+    if payload == "a:stats": return pick(uid,"a:statone","Выберите тренировку:")
+    if payload == "a:broadcast": return pick(uid,"a:bcastone","Кому отправить сообщение?")
+    if payload == "a:export": return pick(uid,"a:exportone","Какую тренировку выгрузить?")
+    if payload == "a:edit": return pick(uid,"a:editone","Какую тренировку изменить?")
+    if payload == "a:close": return pick(uid,"a:doclose","Какую закрыть?","active")
+    if payload == "a:open": return pick(uid,"a:doopen","Какую открыть?","inactive")
+    if payload == "a:archive": return pick(uid,"a:doarchive","Какую архивировать?")
+    if payload == "a:archives": return pick(uid,"a:archshow","Архив:", "archive", True)
+    if payload == "a:delete": return pick(uid,"a:askdelete","Какую удалить?")
 
-    if payload == "a:all":
-        rs = trainings()
-        if not rs:
-            return send(uid, "Тренировок пока нет.", [[btn("⬅️ Админ-меню", "admin")]])
-        text = "📅 Все тренировки:\n\n" + "\n".join(
-            f"{'🟢' if r['active'] else '🔴'} #{r['id']} — {r['date']} • {r['time']} — {r['cnt']}/{r['capacity']}"
-            for r in rs
-        )
-        return send(uid, text, [[btn("⬅️ Админ-меню", "admin")]])
+    if payload.startswith("a:show:"): return show_participants(uid,int(payload.split(":")[-1]))
+    if payload.startswith("a:removelist:"): return show_participants(uid,int(payload.split(":")[-1]),True)
+    if payload.startswith("a:attlist:"): return attendance_list(uid,int(payload.split(":")[-1]))
+    if payload.startswith("a:statone:"): return stats(uid,int(payload.split(":")[-1]))
 
-    if payload == "a:list":
-        return pick(uid, "a:show", "Выберите тренировку:")
-    if payload == "a:remove":
-        return pick(uid, "a:removelist", "Выберите тренировку:")
-    if payload == "a:close":
-        return pick(uid, "a:doclose", "Какую тренировку закрыть?", "active")
-    if payload == "a:open":
-        return pick(uid, "a:doopen", "Какую тренировку открыть?", "inactive")
-    if payload == "a:delete":
-        return pick(uid, "a:askdelete", "Какую тренировку удалить?")
+    if payload.startswith("a:attone:"):
+        rid=int(payload.split(":")[-1])
+        c=conn(); r=c.execute("SELECT name,attendance FROM registrations WHERE id=?",(rid,)).fetchone(); c.close()
+        if not r: return amenu(uid)
+        return send(uid,f"Посещаемость: {r['name']}",
+                    [[btn("✅ Пришёл",f"a:attset:{rid}:yes"),btn("❌ Не пришёл",f"a:attset:{rid}:no")],
+                     [btn("⬅️ Админ-меню","admin")]])
 
-    if payload.startswith("a:show:"):
-        return show_participants(uid, int(payload.split(":")[-1]))
-    if payload.startswith("a:removelist:"):
-        return show_participants(uid, int(payload.split(":")[-1]), True)
+    if payload.startswith("a:attset:"):
+        _,_,rid,val=payload.split(":")
+        value="Пришёл" if val=="yes" else "Не пришёл"
+        c=conn(); c.execute("UPDATE registrations SET attendance=? WHERE id=?",(value,int(rid))); c.commit(); c.close()
+        return send(uid,f"✅ Отмечено: {value}",[[btn("⬅️ Админ-меню","admin")]])
 
     if payload.startswith("a:rmreg:"):
-        rid = int(payload.split(":")[-1])
-        c = db()
-        r = c.execute("""
-            SELECT r.id,r.user_id,r.name,t.date,t.time
-            FROM registrations r JOIN trainings t ON t.id=r.training_id
-            WHERE r.id=?
-        """, (rid,)).fetchone()
+        rid=int(payload.split(":")[-1])
+        c=conn()
+        r=c.execute("""SELECT r.training_id,r.user_id,r.name,t.date,t.time FROM registrations r
+                       JOIN trainings t ON t.id=r.training_id WHERE r.id=?""",(rid,)).fetchone()
         if r:
-            c.execute("DELETE FROM registrations WHERE id=?", (rid,))
-            c.commit()
+            c.execute("DELETE FROM registrations WHERE id=?",(rid,)); c.commit()
         c.close()
-        if not r:
-            return send(uid, "Запись уже отсутствует.", [[btn("⬅️ Админ-меню", "admin")]])
-        send(r["user_id"], f"❌ Администратор отменил вашу запись на тренировку {r['date']} в {r['time']}.")
-        return send(uid, f"✅ {r['name']} удалён(а) из списка.",
-                    [[btn("⬅️ Админ-меню", "admin")]])
+        if r:
+            send(r["user_id"],f"❌ Администратор отменил вашу запись на {r['date']} в {r['time']}.")
+            promote_waitlist(r["training_id"])
+            return send(uid,f"✅ {r['name']} удалён(а).",[[btn("⬅️ Админ-меню","admin")]])
+        return amenu(uid)
 
-    if payload.startswith("a:doclose:"):
-        tid = int(payload.split(":")[-1])
-        c = db()
-        c.execute("UPDATE trainings SET active=0 WHERE id=?", (tid,))
-        c.commit(); c.close()
-        return send(uid, "🔴 Запись на тренировку закрыта.", [[btn("⬅️ Админ-меню", "admin")]])
+    if payload.startswith("a:bcastone:"):
+        tid=int(payload.split(":")[-1])
+        states[uid]={"step":"broadcast","training_id":tid}
+        return send(uid,"📢 Введите сообщение. Оно будет отправлено всем записанным на эту тренировку.")
 
-    if payload.startswith("a:doopen:"):
-        tid = int(payload.split(":")[-1])
-        c = db()
-        c.execute("UPDATE trainings SET active=1 WHERE id=?", (tid,))
-        c.commit(); c.close()
-        return send(uid, "🟢 Запись на тренировку открыта.", [[btn("⬅️ Админ-меню", "admin")]])
+    if payload.startswith("a:exportone:"):
+        tid=int(payload.split(":")[-1])
+        url=f"{PUBLIC_URL}/export/{tid}?key={quote_plus(export_token(tid))}"
+        return send(uid,f"📥 Выгрузка участников CSV:\n{url}\n\nСсылка предназначена для администратора.",
+                    [[btn("⬅️ Админ-меню","admin")]])
+
+    if payload.startswith("a:editone:"):
+        tid=int(payload.split(":")[-1])
+        t=training(tid)
+        if not t: return amenu(uid)
+        states[uid]={"step":"editfield","training_id":tid}
+        return send(uid,f"✏️ Что изменить?\n\n{training_text(t)}",
+                    [[btn("📅 Дату","edit:date"),btn("🕒 Время","edit:time")],
+                     [btn("📍 Площадку","edit:venue"),btn("🏠 Адрес","edit:address")],
+                     [btn("🎯 Дистанцию","edit:distance"),btn("👥 Кол-во мест","edit:capacity")],
+                     [btn("ℹ️ Примечание","edit:note")],[btn("⬅️ Админ-меню","admin")]])
+
+    if payload.startswith("edit:"):
+        st=states.get(uid,{})
+        if st.get("step")!="editfield": return amenu(uid)
+        field=payload.split(":",1)[1]
+        st["field"]=field; st["step"]="editvalue"
+        labels={"date":"дату ДД.ММ.ГГГГ","time":"время ЧЧ:ММ","venue":"название площадки",
+                "address":"полный адрес","distance":"дистанцию (например: 3 м / 5 м)",
+                "capacity":"количество мест","note":"примечание"}
+        return send(uid,f"Введите {labels[field]}:")
+
+    if payload.startswith("a:doclose:") or payload.startswith("a:doopen:"):
+        open_it=payload.startswith("a:doopen:")
+        tid=int(payload.split(":")[-1])
+        c=conn(); c.execute("UPDATE trainings SET active=? WHERE id=?",(1 if open_it else 0,tid)); c.commit(); c.close()
+        return send(uid,"🟢 Запись открыта." if open_it else "🔴 Запись закрыта.",
+                    [[btn("⬅️ Админ-меню","admin")]])
+
+    if payload.startswith("a:doarchive:"):
+        tid=int(payload.split(":")[-1])
+        c=conn(); c.execute("UPDATE trainings SET archived=1,active=0 WHERE id=?",(tid,)); c.commit(); c.close()
+        return send(uid,"🗃 Тренировка перенесена в архив.",[[btn("⬅️ Админ-меню","admin")]])
+
+    if payload.startswith("a:archshow:"):
+        t=training(int(payload.split(":")[-1]))
+        return send(uid,"🗃 Архивная тренировка\n\n"+training_text(t),[[btn("⬅️ Админ-меню","admin")]])
 
     if payload.startswith("a:askdelete:"):
-        tid = int(payload.split(":")[-1])
-        r = training_row(tid)
-        if not r:
-            return amenu(uid)
-        return send(uid,
-            f"⚠️ Удалить тренировку #{tid}\n{r['date']} • {r['time']}?\n\n"
-            "Все записи на неё тоже будут удалены.",
-            [[btn("🗑 Да, удалить", f"a:dodelete:{tid}")],
-             [btn("⬅️ Отмена", "admin")]]
-        )
+        tid=int(payload.split(":")[-1]); t=training(tid)
+        return send(uid,f"⚠️ Удалить тренировку?\n\n{training_text(t)}",
+                    [[btn("🗑 Да, удалить",f"a:dodelete:{tid}")],[btn("⬅️ Отмена","admin")]])
 
     if payload.startswith("a:dodelete:"):
-        tid = int(payload.split(":")[-1])
-        c = db()
-        users = c.execute("SELECT user_id FROM registrations WHERE training_id=?", (tid,)).fetchall()
-        t = c.execute("SELECT date,time FROM trainings WHERE id=?", (tid,)).fetchone()
-        c.execute("DELETE FROM registrations WHERE training_id=?", (tid,))
-        c.execute("DELETE FROM trainings WHERE id=?", (tid,))
+        tid=int(payload.split(":")[-1]); t=training(tid)
+        notify_training_users(tid,f"⚠️ Тренировка {t['date']} в {t['time']} отменена администратором.")
+        c=conn()
+        c.execute("DELETE FROM registrations WHERE training_id=?",(tid,))
+        c.execute("DELETE FROM waitlist WHERE training_id=?",(tid,))
+        c.execute("DELETE FROM trainings WHERE id=?",(tid,))
         c.commit(); c.close()
-        if t:
-            for r in users:
-                send(r["user_id"], f"⚠️ Тренировка {t['date']} в {t['time']} отменена администратором.")
-        return send(uid, "🗑 Тренировка удалена.", [[btn("⬅️ Админ-меню", "admin")]])
+        return send(uid,"🗑 Тренировка удалена.",[[btn("⬅️ Админ-меню","admin")]])
 
     menu(uid)
 
 
 def handle_text(uid, text):
-    if text.lower() in ("/start", "start", "старт", "меню"):
-        states.pop(uid, None)
-        return menu(uid)
+    if text.lower() in ("/start","start","старт","меню"):
+        states.pop(uid,None); return menu(uid)
+    st=states.get(uid)
+    if not st: return menu(uid)
+    step=st.get("step")
 
-    st = states.get(uid)
-    if not st:
-        return menu(uid)
-
-    step = st.get("step")
-
-    if step == "name":
-        name = " ".join(text.strip().split())
+    if step=="name":
+        name=" ".join(text.strip().split())
         if not valid_name(name):
-            return send(uid,
-                "⚠️ Проверьте ФИО.\n\n"
-                "Введите минимум фамилию и имя буквами, без цифр.\n"
-                "Например: Иванов Иван Иванович"
-            )
-        st["name"] = name
-        st["step"] = "phone"
-        return send(uid,
-            "📞 Введите номер телефона.\n\n"
-            "Можно так: 8 927 123-45-67 или +7 927 123-45-67"
-        )
+            return send(uid,"⚠️ Проверьте ФИО. Минимум фамилия и имя, без цифр.")
+        st["name"]=name; st["step"]="phone"
+        return send(uid,"📞 Введите российский мобильный номер.\nНапример: +7 927 123-45-67")
 
-    if step == "phone":
-        phone = normalize_phone(text)
-        if not phone:
-            return send(uid,
-                "⚠️ Номер телефона указан неверно.\n\n"
-                "Нужен российский мобильный номер из 10 цифр после +7.\n"
-                "Например: +7 927 123-45-67"
-            )
-        st["phone"] = phone
-        st["step"] = "gender"
-        return send(uid, "🚻 Выберите пол:", [
-            [btn("Мужчина", "gender:Мужчина"), btn("Женщина", "gender:Женщина")],
-            [btn("⬅️ Отмена", "main")],
-        ])
+    if step=="phone":
+        p=normalize_phone(text)
+        if not p: return send(uid,"⚠️ Номер указан неверно. Например: +7 927 123-45-67")
+        st["phone"]=p; st["step"]="gender"
+        return send(uid,"🚻 Выберите пол:",
+                    [[btn("Мужчина","gender:Мужчина"),btn("Женщина","gender:Женщина")],
+                     [btn("⬅️ Отмена","main")]])
 
-    if step == "adate":
-        if not valid_future_date(text):
-            return send(uid,
-                "⚠️ Неверная дата или дата уже прошла.\n"
-                "Введите в формате ДД.ММ.ГГГГ, например 23.09.2026"
-            )
-        st["date"] = text
-        st["step"] = "atime"
-        return send(uid, "🕒 Введите время в формате ЧЧ:ММ\nНапример: 17:00")
-
-    if step == "atime":
+    if step=="adate":
         try:
-            datetime.strptime(text, "%H:%M")
+            d=datetime.strptime(text,"%d.%m.%Y").date()
+            if d<datetime.now().date(): raise ValueError
         except ValueError:
-            return send(uid, "⚠️ Неверное время. Введите, например: 17:00")
-        st["time"] = text
-        st["step"] = "acap"
-        return send(uid, "👥 Введите максимальное количество участников (от 1 до 500):")
+            return send(uid,"⚠️ Неверная или прошедшая дата. Формат: ДД.ММ.ГГГГ")
+        st["date"]=text; st["step"]="atime"; return send(uid,"🕒 Введите время ЧЧ:ММ")
 
-    if step == "acap":
+    if step=="atime":
+        try: datetime.strptime(text,"%H:%M")
+        except ValueError: return send(uid,"⚠️ Неверное время. Например: 17:00")
+        st["time"]=text; st["step"]="avenue"; return send(uid,"📍 Введите название площадки.\nНапример: тир «Аверс»")
+
+    if step=="avenue":
+        if len(text.strip())<2: return send(uid,"⚠️ Введите название площадки.")
+        st["venue"]=text.strip(); st["step"]="aaddress"; return send(uid,"🏠 Введите полный адрес.")
+
+    if step=="aaddress":
+        if len(text.strip())<5: return send(uid,"⚠️ Введите полный адрес.")
+        st["address"]=text.strip(); st["step"]="adistance"; return send(uid,"🎯 Введите дистанцию.\nНапример: 3 м / 5 м")
+
+    if step=="adistance":
+        st["distance"]=text.strip(); st["step"]="acap"; return send(uid,"👥 Введите количество мест (1–500).")
+
+    if step=="acap":
         try:
-            cap = int(text)
-            if not 1 <= cap <= 500:
-                raise ValueError
-        except ValueError:
-            return send(uid, "⚠️ Введите целое число от 1 до 500.")
-        c = db()
-        duplicate = c.execute(
-            "SELECT id FROM trainings WHERE date=? AND time=?",
-            (st["date"], st["time"])
-        ).fetchone()
-        if duplicate:
-            c.close()
-            return send(uid,
-                f"⚠️ Тренировка на {st['date']} в {st['time']} уже существует.",
-                [[btn("⬅️ Админ-меню", "admin")]]
-            )
-        c.execute(
-            "INSERT INTO trainings(date,time,capacity,active) VALUES(?,?,?,1)",
-            (st["date"], st["time"], cap)
-        )
+            cap=int(text)
+            if not 1<=cap<=500: raise ValueError
+        except ValueError: return send(uid,"⚠️ Введите целое число от 1 до 500.")
+        st["capacity"]=cap; st["step"]="anote"
+        return send(uid,"ℹ️ Введите примечание для участников.\nЕсли примечания нет — отправьте дефис: -")
+
+    if step=="anote":
+        note="" if text.strip()=="-" else text.strip()
+        c=conn()
+        c.execute("""INSERT INTO trainings(date,time,capacity,active,venue,address,distance,note,archived,reminder_sent)
+                     VALUES(?,?,?,?,?,?,?,?,0,0)""",
+                  (st["date"],st["time"],st["capacity"],1,st["venue"],st["address"],st["distance"],note))
+        c.commit(); tid=c.execute("SELECT last_insert_rowid()").fetchone()[0]; c.close()
+        states.pop(uid,None); t=training(tid)
+        return send(uid,"✅ Тренировка создана!\n\n"+training_text(t),[[btn("⬅️ Админ-меню","admin")]])
+
+    if step=="broadcast":
+        tid=st["training_id"]
+        if len(text)>2000: return send(uid,"⚠️ Сообщение слишком длинное. Сократите до 2000 символов.")
+        notify_training_users(tid,"📢 Сообщение организатора\n\n"+text)
+        states.pop(uid,None)
+        return send(uid,"✅ Сообщение отправлено участникам.",[[btn("⬅️ Админ-меню","admin")]])
+
+    if step=="editvalue":
+        tid=st["training_id"]; field=st["field"]; value=text.strip()
+        if field=="date":
+            try:
+                d=datetime.strptime(value,"%d.%m.%Y").date()
+                if d<datetime.now().date(): raise ValueError
+            except ValueError: return send(uid,"⚠️ Неверная дата.")
+        elif field=="time":
+            try: datetime.strptime(value,"%H:%M")
+            except ValueError: return send(uid,"⚠️ Неверное время.")
+        elif field=="capacity":
+            try:
+                value=int(value)
+                if not 1<=value<=500: raise ValueError
+            except ValueError: return send(uid,"⚠️ Количество мест: от 1 до 500.")
+            t=training(tid)
+            if value<t["cnt"]: return send(uid,f"⚠️ Уже записано {t['cnt']} человек. Нельзя поставить меньше.")
+        c=conn()
+        c.execute(f"UPDATE trainings SET {field}=?, reminder_sent=0 WHERE id=?",(value,tid))
         c.commit(); c.close()
-        date, tm = st["date"], st["time"]
-        states.pop(uid, None)
-        return send(uid,
-            f"✅ Тренировка создана!\n\n📅 {date}\n🕒 {tm}\n👥 Мест: {cap}",
-            [[btn("⬅️ Админ-меню", "admin")]]
-        )
+        states.pop(uid,None); t=training(tid)
+        notify_training_users(tid,"⚠️ Изменение по вашей тренировке\n\n"+training_text(t)
+                              +(f"\n\n🗺 Карта: {map_url(t['address'])}" if t["address"] else ""))
+        return send(uid,"✅ Изменения сохранены. Записанные участники уведомлены.\n\n"+training_text(t),
+                    [[btn("⬅️ Админ-меню","admin")]])
 
     menu(uid)
 
 
+def reminder_worker():
+    while True:
+        try:
+            now=datetime.now()
+            c=conn()
+            rs=c.execute("""SELECT * FROM trainings
+                            WHERE active=1 AND archived=0 AND COALESCE(reminder_sent,0)=0""").fetchall()
+            c.close()
+            for t0 in rs:
+                dt=parse_dt(t0["date"],t0["time"])
+                if not dt: continue
+                delta=dt-now
+                if timedelta(hours=23) <= delta <= timedelta(hours=25):
+                    # Claim before sending, preventing duplicate reminders from multiple workers.
+                    c=conn()
+                    cur=c.execute("""UPDATE trainings SET reminder_sent=1
+                                     WHERE id=? AND COALESCE(reminder_sent,0)=0""",(t0["id"],))
+                    c.commit(); claimed=cur.rowcount==1; c.close()
+                    if claimed:
+                        t=training(t0["id"])
+                        msg="⏰ Напоминание: тренировка завтра!\n\n"+training_text(t)
+                        if t["address"]: msg+=f"\n\n🗺 Карта: {map_url(t['address'])}"
+                        notify_training_users(t["id"],msg)
+                elif dt < now - timedelta(hours=6):
+                    c=conn(); c.execute("UPDATE trainings SET archived=1,active=0 WHERE id=?",(t0["id"],)); c.commit(); c.close()
+        except Exception as e:
+            print("REMINDER ERROR",repr(e),flush=True)
+        time.sleep(300)
+
+
+def start_reminder_thread():
+    global reminder_thread_started
+    if not reminder_thread_started:
+        reminder_thread_started=True
+        threading.Thread(target=reminder_worker,daemon=True).start()
+
+
+start_reminder_thread()
+
+
 @app.get("/")
 def home():
-    return "MAX knife training bot: OK", 200
+    return "MAX knife training bot: OK",200
 
 
 @app.post("/webhook")
 def webhook():
     if SECRET and request.headers.get("X-Max-Bot-Api-Secret") != SECRET:
-        return "forbidden", 403
-    u = request.get_json(silent=True) or {}
-    print("UPDATE", u, flush=True)
-    uid = uid_of(u)
+        return "forbidden",403
+    u=request.get_json(silent=True) or {}
+    print("UPDATE",u,flush=True)
+    uid=uid_of(u)
     if uid:
-        if (u.get("update_type") or u.get("type", "")) == "message_callback" or u.get("callback"):
-            callback(u, uid)
-        elif u.get("message") or u.get("update_type") in ("message_created", "bot_started"):
-            handle_text(uid, text_of(u) or "/start")
-    return jsonify({"ok": True})
+        if (u.get("update_type") or u.get("type",""))=="message_callback" or u.get("callback"):
+            callback(u,uid)
+        elif u.get("message") or u.get("update_type") in ("message_created","bot_started"):
+            handle_text(uid,text_of(u) or "/start")
+    return jsonify({"ok":True})
 
 
+@app.get("/export/<int:tid>")
+def export_csv(tid):
+    if request.args.get("key","") != export_token(tid):
+        return "forbidden",403
+    c=conn()
+    t=c.execute("SELECT * FROM trainings WHERE id=?",(tid,)).fetchone()
+    rs=c.execute("""SELECT name,phone,gender,category,svo,attendance,created_at
+                    FROM registrations WHERE training_id=? ORDER BY id""",(tid,)).fetchall()
+    c.close()
+    if not t: return "not found",404
+    sio=io.StringIO()
+    w=csv.writer(sio,delimiter=";")
+    w.writerow(["ФИО","Телефон","Пол","Категория","Участник СВО/ветеран","Посещение","Дата записи"])
+    for r in rs:
+        w.writerow([r["name"],r["phone"],r["gender"],r["category"],r["svo"],r["attendance"],r["created_at"]])
+    data="\ufeff"+sio.getvalue()
+    filename=f"training_{tid}_{t['date'].replace('.','-')}.csv"
+    return Response(data,mimetype="text/csv; charset=utf-8",
+                    headers={"Content-Disposition":f'attachment; filename="{filename}"'})
+
+
+# /setup intentionally disabled after successful webhook registration.
 @app.get("/setup")
-def setup():
-    if request.args.get("key", "") != SECRET or not TOKEN or not SECRET:
-        return "forbidden", 403
-    body = {
-        "url": "https://web-production-971c2.up.railway.app/webhook",
-        "update_types": ["message_created", "message_callback", "bot_started"],
-        "secret": SECRET,
-    }
-    r = requests.post(
-        API + "/subscriptions",
-        headers=hdr(),
-        json=body,
-        timeout=20,
-        verify=False,
-    )
-    return r.text, r.status_code, {"Content-Type": "application/json"}
+def setup_disabled():
+    return "setup disabled",404
 
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8080")))
+if __name__=="__main__":
+    app.run(host="0.0.0.0",port=int(os.environ.get("PORT","8080")))
