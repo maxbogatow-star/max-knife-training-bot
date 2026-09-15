@@ -1,933 +1,164 @@
-import os
-import sqlite3
+import os, sqlite3
 from datetime import datetime
-
-import requests
+import requests, urllib3
 from flask import Flask, request, jsonify
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-app = Flask(__name__)
-
-TOKEN = os.environ.get("MAX_TOKEN", "")
-WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
-ADMIN_ID = os.environ.get("ADMIN_ID", "")
-
-API = "https://platform-api2.max.ru"
-DB = os.environ.get("DB_PATH", "/tmp/bot.db")
-
-states = {}
-
-
-# =========================
-# БАЗА ДАННЫХ
-# =========================
+app=Flask(__name__)
+TOKEN=os.environ.get("MAX_TOKEN","")
+SECRET=os.environ.get("WEBHOOK_SECRET","")
+ADMINS={x.strip() for x in os.environ.get("ADMIN_IDS","").split(",") if x.strip()}
+API="https://platform-api2.max.ru"
+DB=os.environ.get("DB_PATH","/tmp/bot.db")
+states={}
 
 def db():
-    c = sqlite3.connect(DB)
-    c.row_factory = sqlite3.Row
+    c=sqlite3.connect(DB); c.row_factory=sqlite3.Row
+    c.execute("CREATE TABLE IF NOT EXISTS trainings(id INTEGER PRIMARY KEY AUTOINCREMENT,date TEXT,time TEXT,capacity INTEGER,active INTEGER DEFAULT 1)")
+    c.execute("CREATE TABLE IF NOT EXISTS registrations(id INTEGER PRIMARY KEY AUTOINCREMENT,training_id INTEGER,user_id TEXT,name TEXT,phone TEXT,category TEXT,created_at TEXT,UNIQUE(training_id,user_id))")
+    c.commit(); return c
 
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS trainings(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            date TEXT,
-            time TEXT,
-            capacity INTEGER,
-            active INTEGER DEFAULT 1
-        )
-    """)
+def admin(uid): return str(uid) in ADMINS
+def hdr(): return {"Authorization":TOKEN,"Content-Type":"application/json"}
+def btn(t,p): return {"type":"callback","text":t,"payload":p}
+def keyboard(rows): return [{"type":"inline_keyboard","payload":{"buttons":rows}}]
 
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS registrations(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            training_id INTEGER,
-            user_id TEXT,
-            name TEXT,
-            phone TEXT,
-            category TEXT,
-            created_at TEXT,
-            UNIQUE(training_id, user_id)
-        )
-    """)
-
-    c.commit()
-    return c
-
-
-# =========================
-# MAX API
-# =========================
-
-def headers():
-    return {
-        "Authorization": TOKEN,
-        "Content-Type": "application/json"
-    }
-
-
-def kb(rows):
-    return [{
-        "type": "inline_keyboard",
-        "payload": {
-            "buttons": rows
-        }
-    }]
-
-
-def btn(text, payload):
-    return {
-        "type": "callback",
-        "text": text,
-        "payload": payload
-    }
-
-
-def send(uid, text, rows=None):
-    body = {
-        "text": text
-    }
-
-    if rows:
-        body["attachments"] = kb(rows)
-
+def send(uid,text,rows=None):
+    body={"text":text}
+    if rows: body["attachments"]=keyboard(rows)
     try:
-        r = requests.post(
-            f"{API}/messages",
-            params={"user_id": uid},
-            headers=headers(),
-            json=body,
-            timeout=20,
-            verify=False
-        )
+        r=requests.post(API+"/messages",params={"user_id":uid},headers=hdr(),json=body,timeout=20,verify=False)
+        print("SEND",r.status_code,r.text,flush=True)
+    except Exception as e: print("SEND ERROR",repr(e),flush=True)
 
-        print(
-            "SEND:",
-            r.status_code,
-            r.text,
-            flush=True
-        )
+def answer(cid):
+    if not cid:return
+    try: requests.post(API+"/answers",params={"callback_id":cid},headers=hdr(),json={"notification":"Готово"},timeout=20,verify=False)
+    except Exception as e: print("ANSWER ERROR",repr(e),flush=True)
 
-        return r
+def menu(uid):
+    rows=[[btn("🎯 Записаться","book")],[btn("📋 Мои записи","mine")],[btn("❌ Отменить запись","cancel")],[btn("ℹ️ Информация","info")]]
+    if admin(uid): rows.append([btn("⚙️ Администрирование","admin")])
+    send(uid,"🎯 Спортивное метание ножа | Самара\n\nВыберите действие:",rows)
 
-    except Exception as e:
-        print(
-            "SEND ERROR:",
-            repr(e),
-            flush=True
-        )
-        return None
+def amenu(uid):
+    if not admin(uid): return menu(uid)
+    send(uid,"⚙️ Администрирование\n\nВыберите действие:",[
+        [btn("➕ Создать тренировку","a:new")],[btn("📅 Все тренировки","a:all")],
+        [btn("👥 Записавшиеся","a:list")],[btn("🔴 Закрыть запись","a:close")],
+        [btn("🟢 Открыть запись","a:open")],[btn("🗑 Удалить тренировку","a:delete")],
+        [btn("⬅️ Главное меню","main")]])
 
+def trainings():
+    c=db(); r=c.execute("SELECT t.*,COUNT(r.id) cnt FROM trainings t LEFT JOIN registrations r ON r.training_id=t.id GROUP BY t.id ORDER BY t.id DESC").fetchall(); c.close(); return r
 
-def answer(cb_id, text="Готово"):
-    if not cb_id:
-        return
+def pick(uid,action,title,mode=None):
+    rs=trainings()
+    if mode=="active": rs=[r for r in rs if r["active"]]
+    if mode=="inactive": rs=[r for r in rs if not r["active"]]
+    if not rs:return send(uid,"Подходящих тренировок нет.",[[btn("⬅️ Админ-меню","admin")]])
+    rows=[[btn(f"{'🟢' if r['active'] else '🔴'} #{r['id']} {r['date']} • {r['time']} ({r['cnt']}/{r['capacity']})",f"{action}:{r['id']}")] for r in rs]
+    rows.append([btn("⬅️ Админ-меню","admin")]); send(uid,title,rows)
 
-    try:
-        r = requests.post(
-            f"{API}/answers",
-            params={"callback_id": cb_id},
-            headers=headers(),
-            json={"notification": text},
-            timeout=20,
-            verify=False
-        )
-
-        print(
-            "ANSWER:",
-            r.status_code,
-            r.text,
-            flush=True
-        )
-
-    except Exception as e:
-        print(
-            "ANSWER ERROR:",
-            repr(e),
-            flush=True
-        )
-
-
-# =========================
-# ГЛАВНОЕ МЕНЮ
-# =========================
-
-def main_menu(uid):
-    send(
-        uid,
-        "🎯 Спортивное метание ножа | Самара\n\n"
-        "Выберите действие:",
-        [
-            [btn("🎯 Записаться", "book")],
-            [btn("📋 Мои записи", "mine")],
-            [btn("❌ Отменить запись", "cancel")],
-            [btn("ℹ️ Информация", "info")]
-        ]
-    )
-
-
-# =========================
-# ТРЕНИРОВКИ
-# =========================
-
-def available():
-    c = db()
-
-    rows = c.execute("""
-        SELECT
-            t.*,
-            COUNT(r.id) AS cnt
-        FROM trainings t
-        LEFT JOIN registrations r
-            ON r.training_id = t.id
-        WHERE t.active = 1
-        GROUP BY t.id
-        ORDER BY t.date, t.time
-    """).fetchall()
-
-    c.close()
-
-    return [
-        r for r in rows
-        if r["cnt"] < r["capacity"]
-    ]
-
-
-def show_trainings(uid):
-    rows = available()
-
-    if not rows:
-        send(
-            uid,
-            "Сейчас нет открытых тренировок.\n\n"
-            "Как только появится новая дата, "
-            "она будет доступна здесь."
-        )
-        return
-
-    buttons = []
-
-    for r in rows:
-        left = r["capacity"] - r["cnt"]
-
-        buttons.append([
-            btn(
-                f"📅 {r['date']} • {r['time']} • мест {left}",
-                f"choose:{r['id']}"
-            )
-        ])
-
-    send(
-        uid,
-        "Выберите тренировку:",
-        buttons
-    )
-
-
-# =========================
-# ДАННЫЕ UPDATE
-# =========================
-
-def user_id(update):
-    paths = [
-        ("message", "sender", "user_id"),
-        ("callback", "user", "user_id"),
-        ("user", "user_id")
-    ]
-
-    for path in paths:
-        x = update
-
+def uid_of(u):
+    for path in [("message","sender","user_id"),("callback","user","user_id"),("user","user_id")]:
+        x=u
         try:
-            for p in path:
-                x = x[p]
+            for p in path:x=x[p]
+            return str(x)
+        except: pass
 
-            if x is not None:
-                return str(x)
+def text_of(u):
+    return (u.get("message",{}).get("body",{}).get("text") or u.get("message",{}).get("text") or "").strip()
 
-        except Exception:
-            pass
+def mine(uid,cancel=False):
+    c=db(); rs=c.execute("SELECT r.id,t.date,t.time,r.name FROM registrations r JOIN trainings t ON t.id=r.training_id WHERE r.user_id=? ORDER BY t.date,t.time",(uid,)).fetchall(); c.close()
+    if not rs:return send(uid,"У вас пока нет записей.",[[btn("⬅️ Главное меню","main")]])
+    if cancel:return send(uid,"Какую запись отменить?",[[btn(f"❌ {r['date']} • {r['time']}",f"del:{r['id']}")] for r in rs]+[[btn("⬅️ Главное меню","main")]])
+    send(uid,"📋 Ваши записи:\n\n"+"\n".join(f"• {r['date']} в {r['time']} — {r['name']}" for r in rs),[[btn("⬅️ Главное меню","main")]])
 
-    return None
-
-
-def text_of(update):
-    try:
-        return (
-            update
-            .get("message", {})
-            .get("body", {})
-            .get("text")
-            or update
-            .get("message", {})
-            .get("text")
-            or ""
-        ).strip()
-
-    except Exception:
-        return ""
-
-
-def callback_of(update):
-    c = update.get("callback") or {}
-
-    return (
-        c.get("payload", ""),
-        c.get("callback_id")
-    )
-
-
-# =========================
-# МОИ ЗАПИСИ
-# =========================
-
-def mine(uid, cancel_mode=False):
-    c = db()
-
-    rows = c.execute("""
-        SELECT
-            r.id,
-            t.date,
-            t.time,
-            r.name
-        FROM registrations r
-        JOIN trainings t
-            ON t.id = r.training_id
-        WHERE r.user_id = ?
-        ORDER BY t.date, t.time
-    """, (uid,)).fetchall()
-
-    c.close()
-
-    if not rows:
-        send(
-            uid,
-            "У вас пока нет записей."
-        )
+def callback(u,uid):
+    c=u.get("callback") or {}; p=c.get("payload",""); answer(c.get("callback_id"))
+    if p=="main": states.pop(uid,None); return menu(uid)
+    if p=="admin": return amenu(uid)
+    if p=="book":
+        rs=[r for r in trainings() if r["active"] and r["cnt"]<r["capacity"]]
+        if not rs:return send(uid,"Сейчас нет открытых тренировок.",[[btn("⬅️ Главное меню","main")]])
+        return send(uid,"Выберите тренировку:",[[btn(f"📅 {r['date']} • {r['time']} • мест {r['capacity']-r['cnt']}",f"choose:{r['id']}")] for r in rs]+[[btn("⬅️ Главное меню","main")]])
+    if p=="mine": return mine(uid)
+    if p=="cancel": return mine(uid,True)
+    if p=="info": return send(uid,"📍 Самара, ул. Пионерская, 108, тир «Аверс».\n\nЗапись на тренировки по спортивному метанию ножа.",[[btn("⬅️ Главное меню","main")]])
+    if p.startswith("a:") and not admin(uid):return menu(uid)
+    if p=="a:new": states[uid]={"step":"adate"}; return send(uid,"Введите дату тренировки, например: 20.09.2026")
+    if p=="a:all":
+        rs=trainings(); text="📅 Все тренировки:\n\n"+("\n".join(f"{'🟢' if r['active'] else '🔴'} #{r['id']} — {r['date']} {r['time']} — {r['cnt']}/{r['capacity']}" for r in rs) if rs else "Тренировок нет.")
+        return send(uid,text,[[btn("⬅️ Админ-меню","admin")]])
+    if p=="a:list":return pick(uid,"alist","Выберите тренировку:")
+    if p=="a:close":return pick(uid,"aclose","Какую тренировку закрыть?","active")
+    if p=="a:open":return pick(uid,"aopen","Какую тренировку открыть?","inactive")
+    if p=="a:delete":return pick(uid,"adel","Какую тренировку удалить?")
+    if p.startswith("alist:"):
+        tid=int(p.split(":")[1]); c=db(); tr=c.execute("SELECT * FROM trainings WHERE id=?",(tid,)).fetchone(); rs=c.execute("SELECT * FROM registrations WHERE training_id=? ORDER BY id",(tid,)).fetchall(); c.close()
+        text=f"👥 {tr['date']} • {tr['time']}\n\n"+("\n".join(f"{i+1}. {r['name']} — {r['phone']} — {r['category']}" for i,r in enumerate(rs)) if rs else "Записей пока нет.")
+        return send(uid,text,[[btn("⬅️ Админ-меню","admin")]])
+    if p.startswith("aclose:") or p.startswith("aopen:"):
+        tid=int(p.split(":")[1]); val=0 if p.startswith("aclose:") else 1; c=db(); c.execute("UPDATE trainings SET active=? WHERE id=?",(val,tid)); c.commit(); c.close()
+        return send(uid,("🔴 Запись закрыта." if not val else "🟢 Запись открыта."),[[btn("⬅️ Админ-меню","admin")]])
+    if p.startswith("adel:"):
+        tid=int(p.split(":")[1]); return send(uid,f"⚠️ Удалить тренировку #{tid} и все записи?",[[btn("🗑 Да, удалить",f"adelok:{tid}")],[btn("⬅️ Нет","admin")]])
+    if p.startswith("adelok:"):
+        tid=int(p.split(":")[1]); c=db(); c.execute("DELETE FROM registrations WHERE training_id=?",(tid,)); c.execute("DELETE FROM trainings WHERE id=?",(tid,)); c.commit(); c.close(); return send(uid,"🗑 Тренировка удалена.",[[btn("⬅️ Админ-меню","admin")]])
+    if p.startswith("choose:"): states[uid]={"step":"name","tid":int(p.split(":")[1])}; return send(uid,"Введите ФИО участника:")
+    if p.startswith("cat:"):
+        s=states.get(uid)
+        if not s:return menu(uid)
+        c=db(); tr=c.execute("SELECT * FROM trainings WHERE id=?",(s["tid"],)).fetchone(); cnt=c.execute("SELECT COUNT(*) n FROM registrations WHERE training_id=?",(s["tid"],)).fetchone()["n"]
+        if not tr or not tr["active"] or cnt>=tr["capacity"]: c.close(); states.pop(uid,None); return send(uid,"Места уже закончились.")
+        try:c.execute("INSERT INTO registrations(training_id,user_id,name,phone,category,created_at) VALUES(?,?,?,?,?,?)",(s["tid"],uid,s["name"],s["phone"],p.split(":",1)[1],datetime.now().isoformat())); c.commit()
+        except sqlite3.IntegrityError:c.close(); states.pop(uid,None); return send(uid,"Вы уже записаны на эту тренировку.")
+        c.close(); states.pop(uid,None); send(uid,f"✅ Вы записаны!\n📅 {tr['date']}\n⏰ {tr['time']}\n👤 {s['name']}\n📞 {s['phone']}",[[btn("⬅️ Главное меню","main")]])
+        for a in ADMINS:send(a,f"🎯 Новая запись\n{s['name']}\n📅 {tr['date']} • {tr['time']}\n📞 {s['phone']}\nMAX ID: {uid}")
         return
-
-    if cancel_mode:
-        buttons = [
-            [
-                btn(
-                    f"❌ {r['date']} • {r['time']}",
-                    f"del:{r['id']}"
-                )
-            ]
-            for r in rows
-        ]
-
-        send(
-            uid,
-            "Какую запись отменить?",
-            buttons
-        )
-
-        return
-
-    text = "📋 Ваши записи:\n\n"
-
-    text += "\n".join(
-        f"• {r['date']} в {r['time']} — {r['name']}"
-        for r in rows
-    )
-
-    send(uid, text)
-
-
-# =========================
-# CALLBACK КНОПКИ
-# =========================
-
-def handle_callback(update, uid):
-    payload, cbid = callback_of(update)
-
-    answer(cbid)
-
-    if payload == "book":
-        show_trainings(uid)
-        return
-
-    if payload == "mine":
-        mine(uid)
-        return
-
-    if payload == "cancel":
-        mine(uid, True)
-        return
-
-    if payload == "info":
-        send(
-            uid,
-            "ℹ️ Спортивное метание ножа | Самара\n\n"
-            "📍 Самара, ул. Пионерская, 108, "
-            "тир «Аверс».\n\n"
-            "Через этого бота можно записаться "
-            "на доступные тренировки."
-        )
-        return
-
-    if payload.startswith("choose:"):
-        tid = int(
-            payload.split(":")[1]
-        )
-
-        states[uid] = {
-            "step": "name",
-            "training_id": tid
-        }
-
-        send(
-            uid,
-            "Введите ФИО участника:"
-        )
-
-        return
-
-    if payload.startswith("cat:"):
-        s = states.get(uid)
-
-        if not s:
-            main_menu(uid)
-            return
-
-        s["category"] = payload.split(
-            ":", 1
-        )[1]
-
-        c = db()
-
-        try:
-            tr = c.execute(
-                "SELECT * FROM trainings WHERE id=?",
-                (s["training_id"],)
-            ).fetchone()
-
-            cnt = c.execute(
-                """
-                SELECT COUNT(*) AS n
-                FROM registrations
-                WHERE training_id=?
-                """,
-                (s["training_id"],)
-            ).fetchone()["n"]
-
-            if (
-                not tr
-                or not tr["active"]
-                or cnt >= tr["capacity"]
-            ):
-                c.close()
-
-                send(
-                    uid,
-                    "К сожалению, места "
-                    "на эту тренировку уже закончились."
-                )
-
-                states.pop(uid, None)
-                return
-
-            c.execute("""
-                INSERT INTO registrations(
-                    training_id,
-                    user_id,
-                    name,
-                    phone,
-                    category,
-                    created_at
-                )
-                VALUES(?,?,?,?,?,?)
-            """, (
-                s["training_id"],
-                uid,
-                s["name"],
-                s["phone"],
-                s["category"],
-                datetime.now().isoformat()
-            ))
-
-            c.commit()
-
-        except sqlite3.IntegrityError:
-            c.close()
-
-            send(
-                uid,
-                "Вы уже записаны "
-                "на эту тренировку."
-            )
-
-            states.pop(uid, None)
-            return
-
-        c.close()
-
-        send(
-            uid,
-            f"✅ Вы записаны!\n\n"
-            f"📅 {tr['date']}\n"
-            f"⏰ {tr['time']}\n"
-            f"👤 {s['name']}\n"
-            f"📞 {s['phone']}\n"
-            f"Категория: {s['category']}"
-        )
-
-        if ADMIN_ID:
-            send(
-                ADMIN_ID,
-                f"🎯 Новая запись\n\n"
-                f"👤 {s['name']}\n"
-                f"📅 {tr['date']}\n"
-                f"⏰ {tr['time']}\n"
-                f"📞 {s['phone']}\n"
-                f"Категория: {s['category']}\n"
-                f"MAX ID: {uid}"
-            )
-
-        states.pop(uid, None)
-        return
-
-    if payload.startswith("del:"):
-        rid = int(
-            payload.split(":")[1]
-        )
-
-        c = db()
-
-        row = c.execute(
-            """
-            SELECT *
-            FROM registrations
-            WHERE id=? AND user_id=?
-            """,
-            (rid, uid)
-        ).fetchone()
-
-        if row:
-            c.execute(
-                "DELETE FROM registrations WHERE id=?",
-                (rid,)
-            )
-
-            c.commit()
-
-            send(
-                uid,
-                "✅ Запись отменена."
-            )
-
-        c.close()
-        return
-
-
-# =========================
-# ОБЫЧНЫЕ СООБЩЕНИЯ
-# =========================
-
-def handle_text(update, uid, text):
-    if text.lower() in [
-        "/start",
-        "start",
-        "старт",
-        "меню"
-    ]:
-        states.pop(uid, None)
-        main_menu(uid)
-        return
-
-    # Создание тренировки администратором
-    if (
-        ADMIN_ID
-        and uid == ADMIN_ID
-        and text.startswith("/slot ")
-    ):
-        try:
-            _, date, time, cap = text.split()
-
-            cap = int(cap)
-
-            c = db()
-
-            c.execute(
-                """
-                INSERT INTO trainings(
-                    date,
-                    time,
-                    capacity
-                )
-                VALUES(?,?,?)
-                """,
-                (date, time, cap)
-            )
-
-            c.commit()
-            c.close()
-
-            send(
-                uid,
-                f"✅ Тренировка создана\n\n"
-                f"📅 {date}\n"
-                f"⏰ {time}\n"
-                f"👥 Мест: {cap}"
-            )
-
-        except Exception:
-            send(
-                uid,
-                "Формат команды:\n"
-                "/slot 20.09.2026 18:00 12"
-            )
-
-        return
-
-    if (
-        ADMIN_ID
-        and uid == ADMIN_ID
-        and text == "/slots"
-    ):
-        c = db()
-
-        rows = c.execute("""
-            SELECT
-                t.*,
-                COUNT(r.id) AS cnt
-            FROM trainings t
-            LEFT JOIN registrations r
-                ON r.training_id=t.id
-            GROUP BY t.id
-            ORDER BY t.id DESC
-        """).fetchall()
-
-        c.close()
-
-        if not rows:
-            send(
-                uid,
-                "Тренировок пока нет."
-            )
-            return
-
-        text_out = "\n".join(
-            f"#{r['id']} "
-            f"{r['date']} "
-            f"{r['time']} — "
-            f"{r['cnt']}/{r['capacity']} "
-            f"{'🟢' if r['active'] else '🔴'}"
-            for r in rows
-        )
-
-        send(uid, text_out)
-        return
-
-    if (
-        ADMIN_ID
-        and uid == ADMIN_ID
-        and text.startswith("/close ")
-    ):
-        try:
-            tid = int(
-                text.split()[1]
-            )
-
-            c = db()
-
-            c.execute(
-                """
-                UPDATE trainings
-                SET active=0
-                WHERE id=?
-                """,
-                (tid,)
-            )
-
-            c.commit()
-            c.close()
-
-            send(
-                uid,
-                f"🔴 Запись на тренировку "
-                f"#{tid} закрыта."
-            )
-
-        except Exception:
-            send(
-                uid,
-                "Формат команды:\n"
-                "/close 1"
-            )
-
-        return
-
-    if (
-        ADMIN_ID
-        and uid == ADMIN_ID
-        and text.startswith("/list ")
-    ):
-        try:
-            tid = int(
-                text.split()[1]
-            )
-
-            c = db()
-
-            tr = c.execute(
-                """
-                SELECT *
-                FROM trainings
-                WHERE id=?
-                """,
-                (tid,)
-            ).fetchone()
-
-            rows = c.execute(
-                """
-                SELECT *
-                FROM registrations
-                WHERE training_id=?
-                ORDER BY id
-                """,
-                (tid,)
-            ).fetchall()
-
-            c.close()
-
-            if not tr:
-                send(
-                    uid,
-                    "Тренировка не найдена."
-                )
-                return
-
-            result = (
-                f"📋 {tr['date']} "
-                f"{tr['time']}\n\n"
-            )
-
-            if rows:
-                result += "\n".join(
-                    f"{i + 1}. "
-                    f"{r['name']} — "
-                    f"{r['phone']} — "
-                    f"{r['category']}"
-                    for i, r in enumerate(rows)
-                )
-
-            else:
-                result += "Записей пока нет."
-
-            send(uid, result)
-
-        except Exception:
-            send(
-                uid,
-                "Формат команды:\n"
-                "/list 1"
-            )
-
-        return
-
-    # Процесс записи пользователя
-    s = states.get(uid)
-
-    if not s:
-        main_menu(uid)
-        return
-
-    if s["step"] == "name":
-        s["name"] = text
-        s["step"] = "phone"
-
-        send(
-            uid,
-            "Введите номер телефона\n"
-            "(например, +7 927 000-00-00):"
-        )
-
-        return
-
-    if s["step"] == "phone":
-        s["phone"] = text
-        s["step"] = "category"
-
-        send(
-            uid,
-            "Выберите категорию:",
-            [
-                [
-                    btn(
-                        "Общая",
-                        "cat:Общая"
-                    ),
-                    btn(
-                        "ПОДА",
-                        "cat:ПОДА"
-                    )
-                ],
-                [
-                    btn(
-                        "Другая",
-                        "cat:Другая"
-                    )
-                ]
-            ]
-        )
-
-        return
-
-
-# =========================
-# ПРОВЕРКА СЕРВЕРА
-# =========================
+    if p.startswith("del:"):
+        rid=int(p.split(":")[1]); c=db(); c.execute("DELETE FROM registrations WHERE id=? AND user_id=?",(rid,uid)); c.commit(); c.close(); return send(uid,"✅ Запись отменена.",[[btn("⬅️ Главное меню","main")]])
+
+def handle_text(uid,text):
+    if text.lower() in ["/start","start","старт","меню"]:states.pop(uid,None); return menu(uid)
+    s=states.get(uid)
+    if not s:return menu(uid)
+    if s["step"]=="adate" and admin(uid):
+        try:datetime.strptime(text,"%d.%m.%Y")
+        except:return send(uid,"Введите дату в формате ДД.ММ.ГГГГ, например 20.09.2026")
+        s["date"]=text;s["step"]="atime";return send(uid,"Введите время, например 18:00")
+    if s["step"]=="atime" and admin(uid):
+        try:datetime.strptime(text,"%H:%M")
+        except:return send(uid,"Введите время в формате ЧЧ:ММ, например 18:00")
+        s["time"]=text;s["step"]="acap";return send(uid,"Введите количество мест, например 12")
+    if s["step"]=="acap" and admin(uid):
+        try:cap=int(text); assert 1<=cap<=500
+        except:return send(uid,"Введите число мест от 1 до 500.")
+        c=db(); cur=c.execute("INSERT INTO trainings(date,time,capacity) VALUES(?,?,?)",(s["date"],s["time"],cap)); c.commit(); c.close(); tid=cur.lastrowid; date=s["date"];time=s["time"];states.pop(uid,None)
+        return send(uid,f"✅ Тренировка создана!\n#{tid}\n📅 {date}\n⏰ {time}\n👥 Мест: {cap}",[[btn("⬅️ Админ-меню","admin")]])
+    if s["step"]=="name":s["name"]=text;s["step"]="phone";return send(uid,"Введите номер телефона:")
+    if s["step"]=="phone":s["phone"]=text;s["step"]="category";return send(uid,"Выберите категорию:",[[btn("Общая","cat:Общая"),btn("ПОДА","cat:ПОДА")],[btn("Другая","cat:Другая")]])
 
 @app.get("/")
-def health():
-    return (
-        "MAX knife training bot: OK",
-        200
-    )
-
-
-# =========================
-# WEBHOOK MAX
-# =========================
+def health():return "MAX knife training bot: OK",200
 
 @app.post("/webhook")
 def webhook():
-    if (
-        WEBHOOK_SECRET
-        and request.headers.get(
-            "X-Max-Bot-Api-Secret"
-        ) != WEBHOOK_SECRET
-    ):
-        return "forbidden", 403
-
-    update = (
-        request.get_json(
-            silent=True
-        )
-        or {}
-    )
-
-    print(
-        "UPDATE:",
-        update,
-        flush=True
-    )
-
-    uid = user_id(update)
-
+    if SECRET and request.headers.get("X-Max-Bot-Api-Secret")!=SECRET:return "forbidden",403
+    u=request.get_json(silent=True) or {}; print("UPDATE",u,flush=True); uid=uid_of(u)
     if uid:
-        typ = (
-            update.get("update_type")
-            or update.get("type", "")
-        )
-
-        if (
-            typ == "message_callback"
-            or update.get("callback")
-        ):
-            handle_callback(
-                update,
-                uid
-            )
-
-        elif (
-            typ in (
-                "message_created",
-                "bot_started"
-            )
-            or update.get("message")
-        ):
-            text = text_of(update)
-
-            handle_text(
-                update,
-                uid,
-                text or "/start"
-            )
-
-    return jsonify({
-        "ok": True
-    })
-
-
-# =========================
-# РЕГИСТРАЦИЯ WEBHOOK
-# =========================
+        if (u.get("update_type") or u.get("type",""))=="message_callback" or u.get("callback"):callback(u,uid)
+        elif u.get("message") or (u.get("update_type") in ("message_created","bot_started")):handle_text(uid,text_of(u) or "/start")
+    return jsonify({"ok":True})
 
 @app.get("/setup")
 def setup():
-    key = request.args.get(
-        "key",
-        ""
-    )
+    if request.args.get("key","")!=SECRET or not TOKEN or not SECRET:return "forbidden",403
+    body={"url":"https://web-production-971c2.up.railway.app/webhook","update_types":["message_created","message_callback","bot_started"],"secret":SECRET}
+    r=requests.post(API+"/subscriptions",headers=hdr(),json=body,timeout=20,verify=False)
+    return r.text,r.status_code,{"Content-Type":"application/json"}
 
-    if (
-        not TOKEN
-        or not WEBHOOK_SECRET
-        or key != WEBHOOK_SECRET
-    ):
-        return "forbidden", 403
-
-    base = base = "https://web-production-971c2.up.railway.app"
-
-    body = {
-        "url": base + "/webhook",
-        "update_types": [
-            "message_created",
-            "message_callback",
-            "bot_started"
-        ],
-        "secret": WEBHOOK_SECRET
-    }
-
-    try:
-        r = requests.post(
-            f"{API}/subscriptions",
-            headers=headers(),
-            json=body,
-            timeout=20,
-            verify=False
-        )
-
-        print(
-            "SETUP:",
-            r.status_code,
-            r.text,
-            flush=True
-        )
-
-        return (
-            r.text,
-            r.status_code,
-            {
-                "Content-Type":
-                "application/json"
-            }
-        )
-
-    except Exception as e:
-        print(
-            "SETUP ERROR:",
-            repr(e),
-            flush=True
-        )
-
-        return jsonify({
-            "ok": False,
-            "error": str(e)
-        }), 500
-
-
-# =========================
-# ЗАПУСК
-# =========================
-
-if __name__ == "__main__":
-    app.run(
-        host="0.0.0.0",
-        port=int(
-            os.environ.get(
-                "PORT",
-                "8080"
-            )
-        )
-    )
+if __name__=="__main__":app.run(host="0.0.0.0",port=int(os.environ.get("PORT","8080")))
