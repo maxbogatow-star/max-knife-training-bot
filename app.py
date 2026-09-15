@@ -26,7 +26,7 @@ def btn(text,payload): return {'type':'callback','text':text,'payload':payload}
 def send(uid,text,rows=None):
     body={'text':text}
     if rows: body['attachments']=kb(rows)
-    r=requests.post(f'{API}/messages',params={'user_id':uid},headers=headers(),json=body,timeout=15,verify=certifi.where())
+    requests.post(f'{API}/answers',params={'callback_id':cb_id},headers=headers(),json={'notification':text},timeout=15,verify=False)
     return r
 
 def answer(cb_id,text='Готово'):
