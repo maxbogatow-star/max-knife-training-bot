@@ -61,7 +61,7 @@ def pick(uid,action,title,mode=None):
     rows.append([btn("⬅️ Админ-меню","admin")]); send(uid,title,rows)
 
 def uid_of(u):
-    for path in [("message","sender","user_id"),("callback","user","user_id"),("user","user_id")]:
+    for path in [("callback","user","user_id"),("message","sender","user_id"),("user","user_id")]:
         x=u
         try:
             for p in path:x=x[p]
