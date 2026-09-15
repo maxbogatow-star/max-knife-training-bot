@@ -2,6 +2,7 @@ import os, sqlite3, secrets
 from datetime import datetime
 from flask import Flask, request, jsonify
 import requests
+import certifi
 
 app = Flask(__name__)
 TOKEN = os.environ.get('MAX_TOKEN','')
@@ -25,7 +26,7 @@ def btn(text,payload): return {'type':'callback','text':text,'payload':payload}
 def send(uid,text,rows=None):
     body={'text':text}
     if rows: body['attachments']=kb(rows)
-    r=requests.post(f'{API}/messages',params={'user_id':uid},headers=headers(),json=body,timeout=15)
+    r=requests.post(f'{API}/messages',params={'user_id':uid},headers=headers(),json=body,timeout=15,verify=certifi.where())
     return r
 
 def answer(cb_id,text='Готово'):
